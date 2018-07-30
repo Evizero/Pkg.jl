@@ -26,6 +26,7 @@ include("GraphType.jl")
 include("Resolve.jl")
 include("Operations.jl")
 include("API.jl")
+include("Registry.jl")
 include("REPLMode.jl")
 
 import .Types: UPLEVEL_MAJOR, UPLEVEL_MINOR, UPLEVEL_PATCH, UPLEVEL_FIXED

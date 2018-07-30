@@ -75,18 +75,23 @@ function rm(ctx::Context, pkgs::Vector{PackageSpec}; kwargs...)
     return
 end
 
-
-function update_registry(ctx)
+update_registry(registry::Union{String, Types.RegistrySpec}) = update_registry([registry])
+update_registry(registries::Vector{String}) =
+    update_registry([RegistrySpec(name=name) for name in registries])
+update_registry(registry::Vector{Types.RegistrySpec}) = update_registry(Context(), regs)
+function update_registry(ctx, regs::Vector{Types.RegistrySpec}=registries())
     # Update the registry
     errors = Tuple{String, String}[]
     if ctx.preview
         @info("Skipping updating registry in preview mode")
     else
-        for reg in registries()
-            if isdir(joinpath(reg, ".git"))
-                regpath = pathrepr(ctx, reg)
+        # filter out which registries to update
+        all_regs = registries()
+        for reg in regs
+            if isdir(joinpath(reg.path, ".git"))
+                regpath = pathrepr(ctx, reg.path)
                 printpkgstyle(ctx, :Updating, "registry at " * regpath)
-                LibGit2.with(LibGit2.GitRepo, reg) do repo
+                LibGit2.with(LibGit2.GitRepo, reg.path) do repo
                     if LibGit2.isdirty(repo)
                         push!(errors, (regpath, "registry dirty"))
                         return
@@ -100,14 +105,14 @@ function update_registry(ctx)
                         GitTools.fetch(repo; refspecs=["+refs/heads/$branch:refs/remotes/origin/$branch"])
                     catch e
                         e isa CommandError || rethrow(e)
-                        push!(errors, (reg, "failed to fetch from repo"))
+                        push!(errors, (reg.path, "failed to fetch from repo"))
                         return
                     end
                     ff_succeeded = try
                         LibGit2.merge!(repo; branch="refs/remotes/origin/$branch", fastforward=true)
                     catch e
                         e isa LibGit2.GitError && e.code == LibGit2.Error.ENOTFOUND || rethrow(e)
-                        push!(errors, (reg, "branch origin/$branch not found"))
+                        push!(errors, (reg.path, "branch origin/$branch not found"))
                         return
                     end
 
@@ -115,7 +120,7 @@ function update_registry(ctx)
                         try LibGit2.rebase!(repo, "origin/$branch")
                         catch e
                             e isa LibGit2.GitError || rethrow(e)
-                            push!(errors, (reg, "registry failed to rebase on origin/$branch"))
+                            push!(errors, (reg.path, "registry failed to rebase on origin/$branch"))
                             return
                         end
                     end

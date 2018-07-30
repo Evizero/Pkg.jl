@@ -871,50 +871,140 @@ function ensure_resolved(env::EnvCache,
     cmderror(msg)
 end
 
-const DEFAULT_REGISTRIES = Dict("Uncurated" => "https://github.com/JuliaRegistries/Uncurated.git")
+##############
+# Registries #
+##############
 
-# Return paths of all registries in a depot
-function registries(depot::String)::Vector{String}
-    d = joinpath(depot, "registries")
-    ispath(d) || return String[]
-    regs = filter!(readdir(d)) do r
-        isfile(joinpath(d, r, "Registry.toml"))
-    end
-    String[joinpath(depot, "registries", r) for r in regs]
+mutable struct RegistrySpec
+    name::Union{String,Nothing}
+    uuid::Union{UUID,Nothing}
+    url::Union{String,Nothing}
+    path::Union{String,Nothing}
+    RegistrySpec(;name=nothing, uuid=nothing, url=nothing, path=nothing) =
+        new(name, isa(uuid, String) ? UUID(uuid) : uuid, url, path)
 end
 
-# Return paths of all registries in all depots
-function registries(; clone_default=true)::Vector{String}
-    isempty(depots()) && return String[]
+const DEFAULT_REGISTRIES =
+    RegistrySpec[RegistrySpec(name = "General",
+                              uuid = UUID("c2463f1f-d711-5ace-9c99-4f745c283c7e"),
+                              url = "https://github.com/JuliaRegistries/General.git")]
+
+# Return `RegistrySpec`s of each registry in a depot
+function registries(depot::String)
+    d = joinpath(depot, "registries")
+    regs = RegistrySpec[]
+    ispath(d) || return regs
+    for name in readdir(d)
+        for slug in readdir(joinpath(d, name))
+            file = joinpath(d, name, slug, "Registry.toml")
+            if isfile(file)
+                registry = read_registry(file)
+                # verify_registry(registry)
+                spec = RegistrySpec(name = registry["name"],
+                                    uuid = UUID(registry["uuid"]),
+                                    url = registry["uuid"],
+                                    path = dirname(file))
+                push!(regs, spec)
+            end
+        end
+    end
+    return regs
+end
+
+# Return `RegistrySpec`s of all registries in all depots
+function registries(; clone_default=true)
+    isempty(depots()) && return RegistrySpec[]
     user_regs = abspath(depots()[1], "registries")
     if clone_default
         if !ispath(user_regs)
             mkpath(user_regs)
-            Base.shred!(LibGit2.CachedCredentials()) do creds
-                printpkgstyle(stdout, :Cloning, "default registries into $user_regs")
-                for (reg, url) in DEFAULT_REGISTRIES
-                    path = joinpath(user_regs, reg)
-                    LibGit2.with(GitTools.clone(url, path; header = "registry $reg from $(repr(url))", credentials = creds)) do repo
-                    end
-                end
+            printpkgstyle(stdout, :Cloning, "default registries into $user_regs")
+            for reg in DEFAULT_REGISTRIES
+                clone_registry(reg, dirname(user_regs))
             end
         end
     end
-    return [r for d in depots() for r in registries(d)]
+    return RegistrySpec[r for d in depots() for r in registries(d)]
+end
+
+function clone_registry(rspec::RegistrySpec, depot::String=abspath(depots()[1]))
+    @assert depot in depots() # TODO: How should this behave? Append depot to DEPOTS?
+    @assert rspec.url !== nothing "no registry url specified"
+    # clone to tmpdir first
+    tmp = mktempdir()
+    Base.shred!(LibGit2.CachedCredentials()) do creds
+        LibGit2.with(GitTools.clone(rspec.url, tmp; header = "registry from $(repr(rspec.url))",
+            credentials = creds)) do repo
+        end
+    end
+    # verify that the clone looks like a registry
+    if !isfile(joinpath(tmp, "Registry.toml"))
+        cmderror("no `Registry.toml` file in cloned registry.")
+    end
+    registry = read_registry(joinpath(tmp, "Registry.toml"), #=cache=# false) # don't cache this tmp registry
+    verify_registry(registry)
+    # copy to `depot`
+    slug = Base.package_slug(UUID(registry["uuid"]))
+    regpath = joinpath(depot, "registries", registry["name"], slug)
+    ispath(dirname(regpath)) || mkpath(dirname(regpath))
+    if isdir_windows_workaround(regpath)
+        existing_registry = read_registry(joinpath(regpath, "Registry.toml"))
+        @assert registry["uuid"] == existing_registry["uuid"]
+        @info("registry `$(registry["name"])` already exist in `$(Base.contractuser(dirname(regpath)))`.")
+    else
+        cp(tmp, regpath)
+        printpkgstyle(stdout, :Added, "registry `$(registry["name"])` to `$(Base.contractuser(dirname(regpath)))`")
+    end
+    return nothing
 end
 
 # path -> (mtime, TOML Dict)
 const REGISTRY_CACHE = Dict{String, Tuple{Float64, Dict{String, Any}}}()
 
-function read_registry(reg_file)
+function read_registry(reg_file, cache=true)
     t = mtime(reg_file)
     if haskey(REGISTRY_CACHE, reg_file)
         prev_t, registry = REGISTRY_CACHE[reg_file]
         t == prev_t && return registry
     end
     registry = TOML.parsefile(reg_file)
-    REGISTRY_CACHE[reg_file] = (t, registry)
+    cache && (REGISTRY_CACHE[reg_file] = (t, registry))
     return registry
+end
+
+# verify that the registry looks like a registry
+const REQUIRED_REGISTRY_ENTRIES = ("name", "uuid", "repo", "packages") # ??
+
+function verify_registry(registry::Dict{String, Any})
+    for key in REQUIRED_REGISTRY_ENTRIES
+        haskey(registry, key) || cmderror("no `$key` entry in `Registry.toml`.")
+    end
+end
+
+function remove_registry(rspec::RegistrySpec)
+    @assert rspec.name !== nothing || rspec.uuid !== nothing # TODO: Better error.
+    regs = registries()
+    if rspec.uuid !== nothing # filter by uuid
+        filter!(r -> r.uuid == rspec.uuid, regs)
+    elseif rspec.name !== nothing # filter by name and make sure all have same uuid
+        filter!(r -> r.name == rspec.name, regs)
+        if !all(r -> r.uuid == first(regs).uuid, regs) # complain that name was not enough
+            cmderror("multiple registries with name `$(rspec.name)`, please specify with uuid.")
+        end
+    end
+    if isempty(regs)
+        @info("no registry `$(
+            rspec.name === nothing ? rspec.uuid :
+            rspec.uuid === nothing ? rspec.name :
+            "$(rspec.name)=$(rspec.uuid)")` found.")
+    end
+    @assert all(r -> r.uuid == first(regs).uuid, regs)
+    @assert all(r -> r.name == first(regs).name, regs)
+    for registry in regs
+        printpkgstyle(stdout, :Removing, "registry `$(registry.name)` from $(Base.contractuser(registry.path))")
+        rm(registry.path; force=true, recursive=true)
+    end
+    return nothing
 end
 
 
@@ -957,11 +1047,11 @@ function find_registered!(env::EnvCache,
 
     # note: empty vectors will be left for names & uuids that aren't found
     for registry in registries()
-        data = read_registry(joinpath(registry, "Registry.toml"))
+        data = read_registry(joinpath(registry.path, "Registry.toml"))
         for (_uuid, pkgdata) in data["packages"]
               uuid = UUID(_uuid)
               name = pkgdata["name"]
-              path = abspath(registry, pkgdata["path"])
+              path = abspath(registry.path, pkgdata["path"])
               push!(get!(env.uuids, name, UUID[]), uuid)
               push!(get!(env.paths, uuid, String[]), path)
               push!(get!(env.names, uuid, String[]), name)

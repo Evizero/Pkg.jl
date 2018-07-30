@@ -7,7 +7,7 @@ import REPL
 import REPL: LineEdit, REPLCompletions
 
 import ..devdir, ..Types.casesensitive_isdir, ..TOML
-using ..Types, ..Display, ..Operations, ..API
+using ..Types, ..Display, ..Operations, ..API, ..Registry
 
 ############
 # Commands #
@@ -15,7 +15,7 @@ using ..Types, ..Display, ..Operations, ..API
 @enum(CommandKind, CMD_HELP, CMD_STATUS, CMD_SEARCH, CMD_ADD, CMD_RM, CMD_UP,
                    CMD_TEST, CMD_GC, CMD_PREVIEW, CMD_INIT, CMD_BUILD, CMD_FREE,
                    CMD_PIN, CMD_CHECKOUT, CMD_DEVELOP, CMD_GENERATE, CMD_PRECOMPILE,
-                   CMD_INSTANTIATE, CMD_RESOLVE, CMD_ACTIVATE, CMD_DEACTIVATE)
+                   CMD_INSTANTIATE, CMD_RESOLVE, CMD_ACTIVATE, CMD_REGISTRY)
 
 struct Command
     kind::CommandKind
@@ -46,6 +46,7 @@ const cmds = Dict(
     "instantiate" => CMD_INSTANTIATE,
     "resolve"     => CMD_RESOLVE,
     "activate"    => CMD_ACTIVATE,
+    "registry"    => CMD_REGISTRY,
 )
 
 #################
@@ -118,9 +119,9 @@ function parse_option(word::AbstractString)::Option
     return Option(opts[k], String(k), m.captures[3] == nothing ? nothing : String(m.captures[3]))
 end
 
-###################
-# Package parsing #
-###################
+############################
+# Package/registry parsing #
+############################
 let uuid = raw"(?i)[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}(?-i)",
     name = raw"(\w+)(?:\.jl)?"
     global const name_re = Regex("^$name\$")
@@ -148,6 +149,28 @@ function parse_package(word::AbstractString; add_or_develop=false)::PackageSpec
         cmderror("`$word` cannot be parsed as a package")
     end
 end
+
+# registries can be identified through: uuid, name, or name+uuid
+# when updating. When adding we need a url
+function parse_registry(word::AbstractString; add=false)::Types.RegistrySpec
+    word = replace(word, "~" => homedir())
+    registry = Types.RegistrySpec()
+    if occursin(uuid_re, word)
+        registry.uuid = UUID(word)
+    elseif occursin(name_re, word)
+        registry.name = String(match(name_re, word).captures[1])
+    elseif occursin(name_uuid_re, word)
+        m = match(name_uuid_re, word)
+        registry.name = String(m.captures[1])
+        registry.uuid = UUID(m.captures[2])
+    elseif add # Guess its a URL ...
+        registry.url = String(word)
+    else
+        cmderror("`$word` cannot be parsed as a registry")
+    end
+    return registry
+end
+
 
 ################
 # REPL parsing #
@@ -360,6 +383,7 @@ function do_cmd!(tokens::Vector{Token}, repl)
     cmd.kind == CMD_RESOLVE     ? Base.invokelatest(       do_resolve!, ctx, tokens) :
     cmd.kind == CMD_PRECOMPILE  ? Base.invokelatest(    do_precompile!, ctx, tokens) :
     cmd.kind == CMD_INSTANTIATE ? Base.invokelatest(   do_instantiate!, ctx, tokens) :
+    cmd.kind == CMD_REGISTRY    ? Base.invokelatest(      do_registry!, ctx, tokens) :
         cmderror("`$cmd` command not yet implemented")
     return
 end
@@ -859,6 +883,22 @@ function do_activate!(env::Union{EnvCache,Nothing}, tokens::Vector{Token})
     end
 end
 
+function do_registry!(ctx::Context, tokens::Vector{Token})
+    @assert length(tokens) >= 2 # command + registry
+    cmd = popfirst!(tokens)
+    if !(cmd in ("add", "rm", "up"))
+        cmderror("`registry` does not take `$cmd` as a command")
+    end
+    registry = parse_registry(popfirst!(tokens); add = cmd == "add")
+    if cmd == "add"
+        return Registry.add(registry)
+    elseif cmd == "rm"
+        return Registry.rm(registry)
+    else # cmd == "up"
+        return Registry.up(registry)
+    end
+end
+
 ######################
 # REPL mode creation #
 ######################
@@ -935,12 +975,12 @@ function complete_remote_package(s, i1, i2)
     cmp = String[]
     julia_version = VERSION
     for reg in Types.registries(;clone_default=false)
-        data = Types.read_registry(joinpath(reg, "Registry.toml"))
+        data = Types.read_registry(joinpath(reg.path, "Registry.toml"))
         for (uuid, pkginfo) in data["packages"]
             name = pkginfo["name"]
             if startswith(name, s)
                 compat_data = Operations.load_package_data_raw(
-                    VersionSpec, joinpath(reg, pkginfo["path"], "Compat.toml"))
+                    VersionSpec, joinpath(reg.path, pkginfo["path"], "Compat.toml"))
                 supported_julia_versions = VersionSpec(VersionRange[])
                 for (ver_range, compats) in compat_data
                     for (compat, v) in compats
